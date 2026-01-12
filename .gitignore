@@ -1,0 +1,4 @@
+# .gitignore dosyası içeriği
+myvpn
+*.exe
+*.test
