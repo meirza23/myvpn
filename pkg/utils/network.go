@@ -51,24 +51,28 @@ func ParseIPv4(packet []byte) IPv4 {
 }
 
 func CreateTUN(ipAddr string, peer string, tunName string) *water.Interface {
-	cfg := water.Config{
+	// Linux için Interface ayarı (Linux'ta isim genelde tun0, tun1 olur ama isim zorlamayalım)
+	config := water.Config{
 		DeviceType: water.TUN,
-		PlatformSpecificParams: water.PlatformSpecificParams{
-			Name: tunName,
-		},
 	}
+	// water kütüphanesi Linux'ta ismi kendi de atayabilir,
+	// ama sabit isim istiyorsan config.PlatformSpecificParams.Name kullanabilirsin.
+	// Şimdilik basit tutalım, Linux kendi isimlendirsin (tun0 vb.)
 
-	iface, err := water.New(cfg)
+	iface, err := water.New(config)
 	if err != nil {
 		log.Fatal("Failed to create TUN:", err)
 	}
 
 	log.Println("Allocated TUN interface:", iface.Name())
 
-	// MacOS için syntax (Linux ise ifconfig <dev> <ip> netmask <maske> up olabilir)
-	// MacOS syntax: ifconfig utunX 10.0.0.1 10.0.0.2 up
+	// --- BURASI DEĞİŞTİ (LINUX İÇİN IP KOMUTLARI) ---
+	// Eski (Mac): ifconfig utunX 10.0.0.1 10.0.0.2 up
+	// Yeni (Linux): ip link set dev tun0 up && ip addr add 10.0.0.1 peer 10.0.0.2 dev tun0
+
 	cmds := [][]string{
-		{"ifconfig", iface.Name(), ipAddr, peer, "up"},
+		{"ip", "link", "set", "dev", iface.Name(), "up"},
+		{"ip", "addr", "add", ipAddr, "peer", peer, "dev", iface.Name()},
 	}
 
 	for _, cmd := range cmds {
