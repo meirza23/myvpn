@@ -1,10 +1,14 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"myvpn/pkg/utils" // Proje ismine göre burayı kontrol et
 	"net"
+	"os"
+	"os/signal"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/songgao/water"
 )
@@ -13,8 +17,24 @@ import (
 var vpnKey = []byte("12345678901234567890123456789012")
 
 func main() {
+	outIface := flag.String("iface", "eth0", "Internet çıkış arayüzü (ör. eth0, ens33)")
+	flag.Parse()
+
 	// TUN cihazını oluşturuyoruz
 	tun := utils.CreateTUN("10.0.0.1", "10.0.0.2", "utun6")
+
+	// Routing kurallarını uygula
+	utils.SetupServerRouting(tun.Name(), *outIface)
+
+	// Temiz kapanış: CTRL+C veya kill sinyalinde cleanup yap
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("\nKapatılıyor...")
+		utils.CleanupServerRouting(tun.Name(), *outIface)
+		os.Exit(0)
+	}()
 
 	// Sunucuyu başlatıyoruz
 	socketServer(tun)
