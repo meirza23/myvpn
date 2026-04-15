@@ -1,4 +1,5 @@
-# .gitignore dosyası içeriği
+# Build artifacts
 myvpn
+gui
 *.exe
 *.test
