@@ -19,7 +19,7 @@ fi
 # 2. Projeyi derle → tek binary dosya
 echo "[*] Server derleniyor..."
 cd "$(dirname "$0")/.."
-sudo go build -o /usr/local/bin/myvpn-server ./cmd/server/
+sudo go build -buildvcs=false -o /usr/local/bin/myvpn-server ./cmd/server/
 echo "[✓] Binary: /usr/local/bin/myvpn-server"
 
 # 3. Ağ arayüzünü otomatik bul
