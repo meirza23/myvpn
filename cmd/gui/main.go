@@ -6,6 +6,7 @@ import (
 	"myvpn/pkg/utils"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"image/color"
@@ -21,13 +22,11 @@ import (
 )
 
 // ─── SABİT AYARLAR ───
-// Sunucu IP'sini buradan değiştir. AWS'e geçince buraya yeni IP yaz.
 const ServerIP = "192.168.64.6"
 
-// Anahtar — Server ile aynı olmalı!
 var vpnKey = []byte("12345678901234567890123456789012")
 
-// VPN durumu
+// ─── VPN DURUMU ───
 type VPNState struct {
 	mu        sync.Mutex
 	connected bool
@@ -35,81 +34,134 @@ type VPNState struct {
 	origDev   string
 	tunIface  *water.Interface
 	stopChan  chan struct{}
+	startTime time.Time
+	bytesSent atomic.Uint64
+	bytesRecv atomic.Uint64
 }
 
 func main() {
-	myApp := app.New()
-	myWindow := myApp.NewWindow("MyVPN Client")
-	myWindow.Resize(fyne.NewSize(460, 420))
+	myApp := app.NewWithID("com.myvpn.client")
+	myApp.Settings().SetTheme(theme.DarkTheme())
+
+	myWindow := myApp.NewWindow("MyVPN")
+	myWindow.Resize(fyne.NewSize(480, 500))
+	myWindow.SetFixedSize(true)
 
 	state := &VPNState{}
 
 	// ─── BAŞLIK ───
-	title := canvas.NewText("MyVPN", color.White)
-	title.TextSize = 28
+	title := canvas.NewText("⬡ MyVPN", color.NRGBA{R: 99, G: 179, B: 237, A: 255})
+	title.TextSize = 32
 	title.TextStyle = fyne.TextStyle{Bold: true}
 	title.Alignment = fyne.TextAlignCenter
 
-	subtitle := canvas.NewText("AES-256-GCM Encrypted VPN", color.NRGBA{R: 150, G: 150, B: 150, A: 255})
+	subtitle := canvas.NewText("AES-256-GCM • "+ServerIP, color.NRGBA{R: 113, G: 128, B: 150, A: 255})
 	subtitle.TextSize = 12
 	subtitle.Alignment = fyne.TextAlignCenter
 
-	header := container.NewVBox(title, subtitle, widget.NewSeparator())
+	// ─── DURUM GÖSTERGESI ───
+	statusDot := canvas.NewCircle(color.NRGBA{R: 245, G: 101, B: 101, A: 255})
+	statusDot.Resize(fyne.NewSize(12, 12))
+	statusText := canvas.NewText("Bağlı Değil", color.NRGBA{R: 245, G: 101, B: 101, A: 255})
+	statusText.TextSize = 18
+	statusText.TextStyle = fyne.TextStyle{Bold: true}
+	statusRow := container.NewHBox(layout.NewSpacer(), statusDot, statusText, layout.NewSpacer())
 
-	// ─── DURUM GÖSTERGESİ ───
-	statusCircle := canvas.NewCircle(color.NRGBA{R: 220, G: 50, B: 50, A: 255})
-	statusCircle.Resize(fyne.NewSize(14, 14))
-	statusLabel := canvas.NewText("Bağlı Değil", color.NRGBA{R: 220, G: 50, B: 50, A: 255})
-	statusLabel.TextSize = 16
-	statusLabel.TextStyle = fyne.TextStyle{Bold: true}
+	// ─── BAĞLANTI SÜRESİ ───
+	timerLabel := canvas.NewText("", color.NRGBA{R: 160, G: 174, B: 192, A: 255})
+	timerLabel.TextSize = 13
+	timerLabel.Alignment = fyne.TextAlignCenter
 
-	statusRow := container.NewHBox(layout.NewSpacer(), statusCircle, statusLabel, layout.NewSpacer())
+	// ─── VERİ İSTATİSTİKLERİ ───
+	sentLabel := canvas.NewText("↑ 0 B", color.NRGBA{R: 154, G: 230, B: 180, A: 255})
+	sentLabel.TextSize = 12
+	recvLabel := canvas.NewText("↓ 0 B", color.NRGBA{R: 144, G: 205, B: 244, A: 255})
+	recvLabel.TextSize = 12
+	statsRow := container.NewHBox(layout.NewSpacer(), sentLabel, canvas.NewText("   ", color.Transparent), recvLabel, layout.NewSpacer())
 
-	// ─── SUNUCU BİLGİSİ ───
-	serverInfo := canvas.NewText("Sunucu: "+ServerIP, color.NRGBA{R: 180, G: 180, B: 180, A: 255})
-	serverInfo.TextSize = 13
-	serverInfo.Alignment = fyne.TextAlignCenter
+	// ─── PROGRESS BAR (bağlanırken) ───
+	progress := widget.NewProgressBarInfinite()
+	progress.Hide()
 
 	// ─── LOG PANELİ ───
 	logText := widget.NewLabel("")
 	logText.Wrapping = fyne.TextWrapWord
 	logScroll := container.NewVScroll(logText)
-	logScroll.SetMinSize(fyne.NewSize(420, 160))
+	logScroll.SetMinSize(fyne.NewSize(440, 150))
 
 	logLines := ""
 	appendLog := func(msg string) {
-		timestamp := time.Now().Format("15:04:05")
-		logLines += fmt.Sprintf("[%s] %s\n", timestamp, msg)
+		ts := time.Now().Format("15:04:05")
+		logLines += fmt.Sprintf("[%s] %s\n", ts, msg)
 		logText.SetText(logLines)
 		logScroll.ScrollToBottom()
 	}
 
-	// ─── DURUM GÜNCELLEME ───
+	// ─── DURUM GÜNCELLEMESİ ───
+	var timerStop chan struct{}
+
 	setConnected := func(connected bool) {
 		if connected {
-			statusCircle.FillColor = color.NRGBA{R: 50, G: 205, B: 50, A: 255}
-			statusCircle.Refresh()
-			statusLabel.Text = "Bağlı"
-			statusLabel.Color = color.NRGBA{R: 50, G: 205, B: 50, A: 255}
-			statusLabel.Refresh()
+			statusDot.FillColor = color.NRGBA{R: 72, G: 199, B: 142, A: 255}
+			statusDot.Refresh()
+			statusText.Text = "Bağlı"
+			statusText.Color = color.NRGBA{R: 72, G: 199, B: 142, A: 255}
+			statusText.Refresh()
+
+			// Timer başlat
+			timerStop = make(chan struct{})
+			go func() {
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-timerStop:
+						return
+					case <-ticker.C:
+						elapsed := time.Since(state.startTime).Round(time.Second)
+						timerLabel.Text = fmt.Sprintf("⏱  %s", elapsed)
+						timerLabel.Refresh()
+
+						sent := state.bytesSent.Load()
+						recv := state.bytesRecv.Load()
+						sentLabel.Text = "↑ " + formatBytes(sent)
+						sentLabel.Refresh()
+						recvLabel.Text = "↓ " + formatBytes(recv)
+						recvLabel.Refresh()
+					}
+				}
+			}()
 		} else {
-			statusCircle.FillColor = color.NRGBA{R: 220, G: 50, B: 50, A: 255}
-			statusCircle.Refresh()
-			statusLabel.Text = "Bağlı Değil"
-			statusLabel.Color = color.NRGBA{R: 220, G: 50, B: 50, A: 255}
-			statusLabel.Refresh()
+			statusDot.FillColor = color.NRGBA{R: 245, G: 101, B: 101, A: 255}
+			statusDot.Refresh()
+			statusText.Text = "Bağlı Değil"
+			statusText.Color = color.NRGBA{R: 245, G: 101, B: 101, A: 255}
+			statusText.Refresh()
+			timerLabel.Text = ""
+			timerLabel.Refresh()
+			sentLabel.Text = "↑ 0 B"
+			sentLabel.Refresh()
+			recvLabel.Text = "↓ 0 B"
+			recvLabel.Refresh()
+
+			if timerStop != nil {
+				close(timerStop)
+				timerStop = nil
+			}
 		}
 	}
 
 	// ─── BUTONLAR ───
 	var startBtn, stopBtn *widget.Button
 
-	startBtn = widget.NewButtonWithIcon("Başlat", theme.MediaPlayIcon(), func() {
+	startBtn = widget.NewButtonWithIcon("  Bağlan", theme.MediaPlayIcon(), func() {
 		startBtn.Disable()
-		appendLog("Bağlantı kuruluyor: " + ServerIP)
+		progress.Show()
+		appendLog("Bağlantı kuruluyor → " + ServerIP)
 
 		go func() {
 			err := connectVPN(state, appendLog)
+			progress.Hide()
 			if err != nil {
 				appendLog("HATA: " + err.Error())
 				startBtn.Enable()
@@ -117,46 +169,62 @@ func main() {
 			}
 			setConnected(true)
 			stopBtn.Enable()
-			appendLog("VPN bağlantısı aktif!")
+			appendLog("VPN aktif!")
 		}()
 	})
+	startBtn.Importance = widget.HighImportance
 
-	stopBtn = widget.NewButtonWithIcon("Durdur", theme.MediaStopIcon(), func() {
+	stopBtn = widget.NewButtonWithIcon("  Kes", theme.MediaStopIcon(), func() {
 		stopBtn.Disable()
 		appendLog("Bağlantı kesiliyor...")
-
 		go func() {
 			disconnectVPN(state, appendLog)
 			setConnected(false)
 			startBtn.Enable()
-			appendLog("VPN bağlantısı kesildi.")
+			appendLog("VPN kapatıldı.")
 		}()
 	})
 	stopBtn.Disable()
 
 	buttons := container.NewGridWithColumns(2, startBtn, stopBtn)
 
-	// ─── LOG BÖLÜMÜ ───
-	logHeader := widget.NewLabel("Olay Günlüğü:")
-	logHeader.TextStyle = fyne.TextStyle{Bold: true}
+	// ─── SEPARATOR & LOG HEADER ───
+	logHeader := canvas.NewText("Olay Günlüğü", color.NRGBA{R: 113, G: 128, B: 150, A: 255})
+	logHeader.TextSize = 11
 
 	// ─── ANA DÜZEN ───
 	content := container.NewVBox(
-		header,
-		statusRow,
-		serverInfo,
+		container.NewPadded(container.NewVBox(title, subtitle)),
 		widget.NewSeparator(),
-		buttons,
+		container.NewPadded(container.NewVBox(
+			statusRow,
+			timerLabel,
+			statsRow,
+		)),
 		widget.NewSeparator(),
-		logHeader,
-		logScroll,
+		container.NewPadded(buttons),
+		progress,
+		widget.NewSeparator(),
+		container.NewPadded(container.NewVBox(logHeader, logScroll)),
 	)
 
-	myWindow.SetContent(container.NewPadded(content))
-
-	appendLog("Hazır — Başlat'a basın.")
-
+	myWindow.SetContent(content)
+	appendLog("Hazır — Bağlan'a basın.")
 	myWindow.ShowAndRun()
+}
+
+// ─── YARDIMCI: byte formatla ───
+func formatBytes(b uint64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.1f GB", float64(b)/(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(b)/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(b)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
 }
 
 // ─── VPN BAĞLANTI FONKSİYONLARI ───
@@ -169,27 +237,23 @@ func connectVPN(state *VPNState, logFn func(string)) error {
 		return fmt.Errorf("zaten bağlı")
 	}
 
-	// TUN oluştur
 	logFn("TUN arayüzü oluşturuluyor...")
 	tun := utils.CreateTUN("10.0.0.2", "10.0.0.1", "utun5")
-	logFn("TUN oluşturuldu: " + tun.Name())
+	logFn("TUN: " + tun.Name())
 
-	// Routing ayarla
-	logFn("Routing kuralları uygulanıyor...")
+	logFn("Routing ayarlanıyor...")
 	origGW, origDev := utils.SetupClientRouting(ServerIP, tun.Name())
-	if origGW != "" {
-		logFn(fmt.Sprintf("Orijinal gateway: %s dev %s", origGW, origDev))
-	}
 
 	state.origGW = origGW
 	state.origDev = origDev
 	state.tunIface = tun
 	state.stopChan = make(chan struct{})
+	state.startTime = time.Now()
+	state.bytesSent.Store(0)
+	state.bytesRecv.Store(0)
 	state.connected = true
 
-	// VPN tünelini başlat
-	go runTunnel(tun, state.stopChan, logFn)
-
+	go runTunnel(tun, state.stopChan, &state.bytesSent, &state.bytesRecv, logFn)
 	return nil
 }
 
@@ -205,15 +269,13 @@ func disconnectVPN(state *VPNState, logFn func(string)) {
 		close(state.stopChan)
 	}
 
-	logFn("Routing temizleniyor...")
 	utils.CleanupClientRouting(ServerIP, state.origGW, state.origDev)
-
 	state.connected = false
 	state.tunIface = nil
-	logFn("Orijinal routing geri yüklendi.")
+	logFn("Routing temizlendi.")
 }
 
-func runTunnel(tun *water.Interface, stop chan struct{}, logFn func(string)) {
+func runTunnel(tun *water.Interface, stop chan struct{}, bytesSent *atomic.Uint64, bytesRecv *atomic.Uint64, logFn func(string)) {
 	addrTCP, _ := net.ResolveUDPAddr("udp", ServerIP+":8080")
 	connTCP, err := net.DialUDP("udp", nil, addrTCP)
 	if err != nil {
@@ -228,10 +290,10 @@ func runTunnel(tun *water.Interface, stop chan struct{}, logFn func(string)) {
 		return
 	}
 
-	logFn("Sunucuya bağlanıldı (8080/TCP + 8081/UDP)")
+	logFn("Sunucuya bağlanıldı ✓")
 
-	go listenNet(connTCP, tun, stop, "TCP")
-	go listenNet(connUDP, tun, stop, "UDP")
+	go listenNet(connTCP, tun, stop, "TCP", bytesRecv)
+	go listenNet(connUDP, tun, stop, "UDP", bytesRecv)
 
 	buf := make([]byte, 2000)
 	for {
@@ -239,7 +301,6 @@ func runTunnel(tun *water.Interface, stop chan struct{}, logFn func(string)) {
 		case <-stop:
 			connTCP.Close()
 			connUDP.Close()
-			logFn("Tünel kapatıldı.")
 			return
 		default:
 		}
@@ -250,7 +311,6 @@ func runTunnel(tun *water.Interface, stop chan struct{}, logFn func(string)) {
 		}
 
 		packet := utils.ParseIPv4(buf[:n])
-
 		encrypted, err := utils.Encrypt(buf[:n], vpnKey)
 		if err != nil {
 			continue
@@ -261,10 +321,11 @@ func runTunnel(tun *water.Interface, stop chan struct{}, logFn func(string)) {
 		} else {
 			connUDP.Write(encrypted)
 		}
+		bytesSent.Add(uint64(n))
 	}
 }
 
-func listenNet(conn *net.UDPConn, tun *water.Interface, stop chan struct{}, label string) {
+func listenNet(conn *net.UDPConn, tun *water.Interface, stop chan struct{}, label string, bytesRecv *atomic.Uint64) {
 	buf := make([]byte, 2000)
 	for {
 		select {
@@ -280,10 +341,11 @@ func listenNet(conn *net.UDPConn, tun *water.Interface, stop chan struct{}, labe
 
 		decrypted, err := utils.Decrypt(buf[:n], vpnKey)
 		if err != nil {
-			log.Printf("[%s] Şifre çözme hatası", label)
+			log.Printf("[%s] şifre çözme hatası", label)
 			continue
 		}
 
 		tun.Write(decrypted)
+		bytesRecv.Add(uint64(n))
 	}
 }
