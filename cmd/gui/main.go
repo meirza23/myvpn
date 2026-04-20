@@ -15,6 +15,7 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -59,7 +60,7 @@ func main() {
 	subtitle.TextSize = 12
 	subtitle.Alignment = fyne.TextAlignCenter
 
-	// ─── DURUM GÖSTERGESI ───
+	// ─── DURUM GÖSTERGESİ ───
 	statusDot := canvas.NewCircle(color.NRGBA{R: 245, G: 101, B: 101, A: 255})
 	statusDot.Resize(fyne.NewSize(12, 12))
 	statusText := canvas.NewText("Bağlı Değil", color.NRGBA{R: 245, G: 101, B: 101, A: 255})
@@ -67,40 +68,46 @@ func main() {
 	statusText.TextStyle = fyne.TextStyle{Bold: true}
 	statusRow := container.NewHBox(layout.NewSpacer(), statusDot, statusText, layout.NewSpacer())
 
-	// ─── BAĞLANTI SÜRESİ ───
-	timerLabel := canvas.NewText("", color.NRGBA{R: 160, G: 174, B: 192, A: 255})
-	timerLabel.TextSize = 13
+	// ─── DATA BINDINGS (goroutine-safe) ───
+	timerBind := binding.NewString()
+	sentBind := binding.NewString()
+	recvBind := binding.NewString()
+	logBind := binding.NewString()
+
+	_ = timerBind.Set("")
+	_ = sentBind.Set("↑ 0 B")
+	_ = recvBind.Set("↓ 0 B")
+	_ = logBind.Set("")
+
+	timerLabel := widget.NewLabelWithData(timerBind)
 	timerLabel.Alignment = fyne.TextAlignCenter
 
-	// ─── VERİ İSTATİSTİKLERİ ───
-	sentLabel := canvas.NewText("↑ 0 B", color.NRGBA{R: 154, G: 230, B: 180, A: 255})
-	sentLabel.TextSize = 12
-	recvLabel := canvas.NewText("↓ 0 B", color.NRGBA{R: 144, G: 205, B: 244, A: 255})
-	recvLabel.TextSize = 12
-	statsRow := container.NewHBox(layout.NewSpacer(), sentLabel, canvas.NewText("   ", color.Transparent), recvLabel, layout.NewSpacer())
+	sentLabel := widget.NewLabelWithData(sentBind)
+	recvLabel := widget.NewLabelWithData(recvBind)
+	statsRow := container.NewHBox(layout.NewSpacer(), sentLabel, widget.NewLabel("   "), recvLabel, layout.NewSpacer())
 
-	// ─── PROGRESS BAR (bağlanırken) ───
-	progress := widget.NewProgressBarInfinite()
-	progress.Hide()
-
-	// ─── LOG PANELİ ───
-	logText := widget.NewLabel("")
-	logText.Wrapping = fyne.TextWrapWord
-	logScroll := container.NewVScroll(logText)
-	logScroll.SetMinSize(fyne.NewSize(440, 150))
-
+	// ─── LOG (binding ile güncelleme) ───
 	logLines := ""
 	appendLog := func(msg string) {
 		ts := time.Now().Format("15:04:05")
 		logLines += fmt.Sprintf("[%s] %s\n", ts, msg)
-		logText.SetText(logLines)
-		logScroll.ScrollToBottom()
+		_ = logBind.Set(logLines)
 	}
+
+	logText := widget.NewLabelWithData(logBind)
+	logText.Wrapping = fyne.TextWrapWord
+	logScroll := container.NewVScroll(logText)
+	logScroll.SetMinSize(fyne.NewSize(440, 150))
+
+	// ─── PROGRESS BAR ───
+	progress := widget.NewProgressBarInfinite()
+	progress.Hide()
 
 	// ─── DURUM GÜNCELLEMESİ ───
 	var timerStop chan struct{}
 
 	setConnected := func(connected bool) {
+		// Bu fonksiyon her zaman fyne.Do() içinden çağrılmalı
 		if connected {
 			statusDot.FillColor = color.NRGBA{R: 72, G: 199, B: 142, A: 255}
 			statusDot.Refresh()
@@ -108,7 +115,6 @@ func main() {
 			statusText.Color = color.NRGBA{R: 72, G: 199, B: 142, A: 255}
 			statusText.Refresh()
 
-			// Timer başlat
 			timerStop = make(chan struct{})
 			go func() {
 				ticker := time.NewTicker(time.Second)
@@ -119,15 +125,9 @@ func main() {
 						return
 					case <-ticker.C:
 						elapsed := time.Since(state.startTime).Round(time.Second)
-						timerLabel.Text = fmt.Sprintf("⏱  %s", elapsed)
-						timerLabel.Refresh()
-
-						sent := state.bytesSent.Load()
-						recv := state.bytesRecv.Load()
-						sentLabel.Text = "↑ " + formatBytes(sent)
-						sentLabel.Refresh()
-						recvLabel.Text = "↓ " + formatBytes(recv)
-						recvLabel.Refresh()
+						_ = timerBind.Set(fmt.Sprintf("⏱  %s", elapsed))
+						_ = sentBind.Set("↑ " + formatBytes(state.bytesSent.Load()))
+						_ = recvBind.Set("↓ " + formatBytes(state.bytesRecv.Load()))
 					}
 				}
 			}()
@@ -137,12 +137,9 @@ func main() {
 			statusText.Text = "Bağlı Değil"
 			statusText.Color = color.NRGBA{R: 245, G: 101, B: 101, A: 255}
 			statusText.Refresh()
-			timerLabel.Text = ""
-			timerLabel.Refresh()
-			sentLabel.Text = "↑ 0 B"
-			sentLabel.Refresh()
-			recvLabel.Text = "↓ 0 B"
-			recvLabel.Refresh()
+			_ = timerBind.Set("")
+			_ = sentBind.Set("↑ 0 B")
+			_ = recvBind.Set("↓ 0 B")
 
 			if timerStop != nil {
 				close(timerStop)
@@ -161,15 +158,17 @@ func main() {
 
 		go func() {
 			err := connectVPN(state, appendLog)
-			progress.Hide()
-			if err != nil {
-				appendLog("HATA: " + err.Error())
-				startBtn.Enable()
-				return
-			}
-			setConnected(true)
-			stopBtn.Enable()
-			appendLog("VPN aktif!")
+			fyne.Do(func() {
+				progress.Hide()
+				if err != nil {
+					appendLog("HATA: " + err.Error())
+					startBtn.Enable()
+					return
+				}
+				setConnected(true)
+				stopBtn.Enable()
+				appendLog("VPN aktif!")
+			})
 		}()
 	})
 	startBtn.Importance = widget.HighImportance
@@ -179,16 +178,17 @@ func main() {
 		appendLog("Bağlantı kesiliyor...")
 		go func() {
 			disconnectVPN(state, appendLog)
-			setConnected(false)
-			startBtn.Enable()
-			appendLog("VPN kapatıldı.")
+			fyne.Do(func() {
+				setConnected(false)
+				startBtn.Enable()
+				appendLog("VPN kapatıldı.")
+			})
 		}()
 	})
 	stopBtn.Disable()
 
 	buttons := container.NewGridWithColumns(2, startBtn, stopBtn)
 
-	// ─── SEPARATOR & LOG HEADER ───
 	logHeader := canvas.NewText("Olay Günlüğü", color.NRGBA{R: 113, G: 128, B: 150, A: 255})
 	logHeader.TextSize = 11
 
@@ -196,11 +196,7 @@ func main() {
 	content := container.NewVBox(
 		container.NewPadded(container.NewVBox(title, subtitle)),
 		widget.NewSeparator(),
-		container.NewPadded(container.NewVBox(
-			statusRow,
-			timerLabel,
-			statsRow,
-		)),
+		container.NewPadded(container.NewVBox(statusRow, timerLabel, statsRow)),
 		widget.NewSeparator(),
 		container.NewPadded(buttons),
 		progress,
@@ -213,7 +209,7 @@ func main() {
 	myWindow.ShowAndRun()
 }
 
-// ─── YARDIMCI: byte formatla ───
+// ─── YARDIMCI ───
 func formatBytes(b uint64) string {
 	switch {
 	case b >= 1<<30:
