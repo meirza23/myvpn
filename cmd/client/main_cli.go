@@ -4,18 +4,18 @@ import (
 	"bufio"
 	"fmt"
 	"log"
+	"myvpn/pkg/config"
 	"myvpn/pkg/utils"
+	"myvpn/pkg/vpn"
 	"net"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/songgao/water"
 )
-
-// DİKKAT: Anahtar tam 32 karakter olmalı. Server ile aynı olmalı!
-var vpnKey = []byte("12345678901234567890123456789012")
 
 // Bağlantı durumu
 var (
@@ -25,9 +25,14 @@ var (
 	origDev   string
 	tunIface  *water.Interface
 	stopChan  chan struct{}
+	vpnKey    []byte
 )
 
 func main() {
+	// Config yükle
+	cfg := config.LoadClientConfig()
+	vpnKey = []byte(cfg.VPNKey)
+
 	// CTRL+C yakalama
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -39,9 +44,9 @@ func main() {
 	}()
 
 	utils.PrintBanner()
+	utils.PrintInfo(fmt.Sprintf("Ayarlar yüklendi — Sunucu: %s, Port: %d", cfg.ServerIP, cfg.Port))
 
 	scanner := bufio.NewScanner(os.Stdin)
-
 	for {
 		utils.PrintStatus(connected, serverIP)
 		utils.PrintMenu(connected)
@@ -54,7 +59,7 @@ func main() {
 		switch choice {
 		case "1":
 			if !connected {
-				connect(scanner)
+				connect(scanner, cfg)
 			} else {
 				disconnect()
 			}
@@ -70,47 +75,65 @@ func main() {
 	}
 }
 
-func connect(scanner *bufio.Scanner) {
-	fmt.Print("\n  Sunucu IP Adresi (ör. 192.168.64.6): ")
+func connect(scanner *bufio.Scanner, cfg *config.ClientConfig) {
+	// Kullanıcıdan IP iste (boş bırakılırsa config değeri kullanılır)
+	fmt.Printf("\n  Sunucu IP [%s]: ", cfg.ServerIP)
 	if !scanner.Scan() {
 		return
 	}
-	serverIP = strings.TrimSpace(scanner.Text())
-	if serverIP == "" {
-		utils.PrintError("IP adresi boş olamaz.")
+	input := strings.TrimSpace(scanner.Text())
+	if input != "" {
+		serverIP = input
+	} else {
+		serverIP = cfg.ServerIP
+	}
+
+	if len(vpnKey) != 32 {
+		utils.PrintError(fmt.Sprintf("VPN anahtarı 32 karakter olmalı (şu an: %d). ~/.myvpn/client.json dosyasını kontrol edin.", len(vpnKey)))
 		return
 	}
 
+	// 1. Handshake
+	utils.PrintInfo("Sunucuya bağlanılıyor (handshake)...")
+	serverAddr := fmt.Sprintf("%s:%d", serverIP, cfg.Port)
+	assignedIP, err := performHandshake(serverAddr)
+	if err != nil {
+		utils.PrintError("Handshake başarısız: " + err.Error())
+		return
+	}
+	utils.PrintSuccess(fmt.Sprintf("Sanal IP atandı: %s", assignedIP))
+
+	// 2. TUN oluştur
 	utils.PrintInfo("TUN arayüzü oluşturuluyor...")
+	tun, err := utils.CreateTUN(assignedIP.String(), "10.0.0.1", "")
+	if err != nil {
+		utils.PrintError("TUN hatası: " + err.Error())
+		return
+	}
+	tunIface = tun
+	utils.PrintInfo("TUN: " + tun.Name())
 
-	// TUN oluştur (Client: 10.0.0.2, Peer: 10.0.0.1)
-	tunIface = utils.CreateTUN("10.0.0.2", "10.0.0.1", "utun5")
-
-	// Routing ayarla
+	// 3. Routing
 	utils.PrintInfo("Routing kuralları uygulanıyor...")
-	origGW, origDev = utils.SetupClientRouting(serverIP, tunIface.Name())
+	origGW, origDev = utils.SetupClientRouting(serverIP, tun.Name())
 
-	// VPN tünelini başlat
+	// 4. Tüneli başlat
 	stopChan = make(chan struct{})
-	go startVPNTunnel(tunIface, serverIP)
+	go startVPNTunnel(tun, serverIP)
 
 	connected = true
-	utils.PrintSuccess(fmt.Sprintf("VPN bağlantısı kuruldu! (%s)", serverIP))
+	utils.PrintSuccess(fmt.Sprintf("VPN bağlantısı kuruldu! (%s → %s)", assignedIP, serverIP))
 }
 
 func disconnect() {
 	if !connected {
 		return
 	}
-
 	utils.PrintInfo("VPN bağlantısı kesiliyor...")
 
-	// Stop sinyali gönder
 	if stopChan != nil {
 		close(stopChan)
 	}
-
-	// Routing'i temizle
 	utils.CleanupClientRouting(serverIP, origGW, origDev)
 
 	connected = false
@@ -119,8 +142,35 @@ func disconnect() {
 	utils.PrintSuccess("VPN bağlantısı kesildi. Orijinal routing geri yüklendi.")
 }
 
+// performHandshake sunucuya Hello gönderir ve atanan sanal IP'yi alır.
+func performHandshake(serverAddr string) (net.IP, error) {
+	addr, err := net.ResolveUDPAddr("udp", serverAddr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	if _, err := conn.Write(vpn.HelloPacket); err != nil {
+		return nil, fmt.Errorf("hello gönderilemedi: %w", err)
+	}
+
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, fmt.Errorf("welcome beklerken zaman aşımı (sunucu çalışıyor mu?): %w", err)
+	}
+
+	return vpn.ParseWelcomePacket(buf[:n])
+}
+
 func startVPNTunnel(tun *water.Interface, srvIP string) {
-	// 1. Bağlantı: TCP paketlerini taşıyacak (Hedef Port 8080)
+	// TCP taşıyıcı: port 8080
 	serverAddrTCP, _ := net.ResolveUDPAddr("udp", srvIP+":8080")
 	connTCP, err := net.DialUDP("udp", nil, serverAddrTCP)
 	if err != nil {
@@ -128,7 +178,7 @@ func startVPNTunnel(tun *water.Interface, srvIP string) {
 		return
 	}
 
-	// 2. Bağlantı: UDP paketlerini taşıyacak (Hedef Port 8081)
+	// UDP taşıyıcı: port 8081
 	serverAddrUDP, _ := net.ResolveUDPAddr("udp", srvIP+":8081")
 	connUDP, err := net.DialUDP("udp", nil, serverAddrUDP)
 	if err != nil {
@@ -136,14 +186,12 @@ func startVPNTunnel(tun *water.Interface, srvIP string) {
 		return
 	}
 
-	log.Println("Connected to server ports 8080 (TCP-Line) and 8081 (UDP-Line) with AES-256-GCM")
+	log.Println("Veri kanalları açıldı: :8080 (TCP-bearer), :8081 (UDP-bearer)")
 
-	// --- SERVER'DAN GELEN CEVAPLARI DİNLE VE ÇÖZ (Net -> TUN) ---
-	go readFromNetToTun(connTCP, tun, "TCP-Line")
-	go readFromNetToTun(connUDP, tun, "UDP-Line")
+	go readFromNetToTun(connTCP, tun, stopChan, "TCP-bearer")
+	go readFromNetToTun(connUDP, tun, stopChan, "UDP-bearer")
 
-	// --- TUN'DAN OKU, ŞİFRELE VE GÖNDER (TUN -> Net) ---
-	buf := make([]byte, 2000)
+	buf := make([]byte, 65535)
 	for {
 		select {
 		case <-stopChan:
@@ -158,45 +206,45 @@ func startVPNTunnel(tun *water.Interface, srvIP string) {
 			continue
 		}
 
-		// 1. Paketin protokolüne bak
 		packet := utils.ParseIPv4(buf[:n])
-
-		// 2. TÜM PAKETİ ŞİFRELE (AES-GCM)
 		encrypted, err := utils.Encrypt(buf[:n], vpnKey)
 		if err != nil {
 			log.Println("Şifreleme hatası:", err)
 			continue
 		}
 
-		// 3. Şifrelenmiş veriyi uygun porttan gönder
 		if packet.Protocol == utils.ProtocolTCP {
 			connTCP.Write(encrypted)
-			log.Printf("[TUN->Net] Encrypted TCP routed to 8080")
 		} else {
 			connUDP.Write(encrypted)
-			log.Printf("[TUN->Net] Encrypted UDP/ICMP routed to 8081")
 		}
 	}
 }
 
-// readFromNetToTun: Sunucudan gelen şifreli paketleri çözer.
-func readFromNetToTun(conn *net.UDPConn, tun *water.Interface, label string) {
-	buf := make([]byte, 2000)
+func readFromNetToTun(conn *net.UDPConn, tun *water.Interface, stop chan struct{}, label string) {
+	buf := make([]byte, 65535)
 	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+
+		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		n, _, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			continue
+			// Timeout ise döngüyü sürdür (stop channel kontrolü için)
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			// Gerçek hata (bağlantı kapatıldı vb.) — gor outine'i sonlandır
+			return
 		}
-
-		// Şifreyi çöz
 		decrypted, err := utils.Decrypt(buf[:n], vpnKey)
 		if err != nil {
-			log.Printf("[%s] Şifre çözme hatası: Paket reddedildi", label)
+			log.Printf("[%s] Şifre çözme hatası: paket reddedildi", label)
 			continue
 		}
-
-		// Çözülen paketi TUN'a yaz
 		tun.Write(decrypted)
-		log.Printf("[Net->TUN] Received and decrypted via %s", label)
 	}
 }

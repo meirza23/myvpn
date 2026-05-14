@@ -2,30 +2,27 @@ package main
 
 import (
 	"fmt"
+	"image/color"
 	"log"
+	"myvpn/pkg/config"
 	"myvpn/pkg/utils"
+	"myvpn/pkg/vpn"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"image/color"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/data/binding"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/songgao/water"
 )
-
-// ─── SABİT AYARLAR ───
-const ServerIP = "192.168.64.6"
-
-var vpnKey = []byte("12345678901234567890123456789012")
 
 // ─── VPN DURUMU ───
 type VPNState struct {
@@ -41,11 +38,14 @@ type VPNState struct {
 }
 
 func main() {
+	// Ayarları yükle
+	cfg := config.LoadClientConfig()
+
 	myApp := app.NewWithID("com.myvpn.client")
 	myApp.Settings().SetTheme(theme.DarkTheme())
 
 	myWindow := myApp.NewWindow("MyVPN")
-	myWindow.Resize(fyne.NewSize(480, 500))
+	myWindow.Resize(fyne.NewSize(480, 560))
 	myWindow.SetFixedSize(true)
 
 	state := &VPNState{}
@@ -56,7 +56,7 @@ func main() {
 	title.TextStyle = fyne.TextStyle{Bold: true}
 	title.Alignment = fyne.TextAlignCenter
 
-	subtitle := canvas.NewText("AES-256-GCM • "+ServerIP, color.NRGBA{R: 113, G: 128, B: 150, A: 255})
+	subtitle := canvas.NewText("AES-256-GCM • "+cfg.ServerIP, color.NRGBA{R: 113, G: 128, B: 150, A: 255})
 	subtitle.TextSize = 12
 	subtitle.Alignment = fyne.TextAlignCenter
 
@@ -68,7 +68,7 @@ func main() {
 	statusText.TextStyle = fyne.TextStyle{Bold: true}
 	statusRow := container.NewHBox(layout.NewSpacer(), statusDot, statusText, layout.NewSpacer())
 
-	// ─── DATA BINDINGS (goroutine-safe) ───
+	// ─── DATA BINDINGS ───
 	timerBind := binding.NewString()
 	sentBind := binding.NewString()
 	recvBind := binding.NewString()
@@ -81,14 +81,16 @@ func main() {
 
 	timerLabel := widget.NewLabelWithData(timerBind)
 	timerLabel.Alignment = fyne.TextAlignCenter
-
 	sentLabel := widget.NewLabelWithData(sentBind)
 	recvLabel := widget.NewLabelWithData(recvBind)
 	statsRow := container.NewHBox(layout.NewSpacer(), sentLabel, widget.NewLabel("   "), recvLabel, layout.NewSpacer())
 
-	// ─── LOG (binding ile güncelleme) ───
+	// ─── LOG (mutex korumalı, goroutine-safe) ───
+	var logMu sync.Mutex
 	logLines := ""
 	appendLog := func(msg string) {
+		logMu.Lock()
+		defer logMu.Unlock()
 		ts := time.Now().Format("15:04:05")
 		logLines += fmt.Sprintf("[%s] %s\n", ts, msg)
 		_ = logBind.Set(logLines)
@@ -97,7 +99,7 @@ func main() {
 	logText := widget.NewLabelWithData(logBind)
 	logText.Wrapping = fyne.TextWrapWord
 	logScroll := container.NewVScroll(logText)
-	logScroll.SetMinSize(fyne.NewSize(440, 150))
+	logScroll.SetMinSize(fyne.NewSize(440, 120))
 
 	// ─── PROGRESS BAR ───
 	progress := widget.NewProgressBarInfinite()
@@ -107,7 +109,6 @@ func main() {
 	var timerStop chan struct{}
 
 	setConnected := func(connected bool) {
-		// Bu fonksiyon her zaman fyne.Do() içinden çağrılmalı
 		if connected {
 			statusDot.FillColor = color.NRGBA{R: 72, G: 199, B: 142, A: 255}
 			statusDot.Refresh()
@@ -154,14 +155,15 @@ func main() {
 	startBtn = widget.NewButtonWithIcon("  Bağlan", theme.MediaPlayIcon(), func() {
 		startBtn.Disable()
 		progress.Show()
-		appendLog("Bağlantı kuruluyor → " + ServerIP)
+		appendLog("Bağlantı kuruluyor → " + cfg.ServerIP)
 
 		go func() {
-			err := connectVPN(state, appendLog)
+			err := connectVPN(state, cfg, appendLog)
 			fyne.Do(func() {
 				progress.Hide()
 				if err != nil {
 					appendLog("HATA: " + err.Error())
+					dialog.ShowError(err, myWindow)
 					startBtn.Enable()
 					return
 				}
@@ -177,7 +179,7 @@ func main() {
 		stopBtn.Disable()
 		appendLog("Bağlantı kesiliyor...")
 		go func() {
-			disconnectVPN(state, appendLog)
+			disconnectVPN(state, cfg, appendLog)
 			fyne.Do(func() {
 				setConnected(false)
 				startBtn.Enable()
@@ -188,12 +190,11 @@ func main() {
 	stopBtn.Disable()
 
 	buttons := container.NewGridWithColumns(2, startBtn, stopBtn)
-
 	logHeader := canvas.NewText("Olay Günlüğü", color.NRGBA{R: 113, G: 128, B: 150, A: 255})
 	logHeader.TextSize = 11
 
-	// ─── ANA DÜZEN ───
-	content := container.NewVBox(
+	// ─── BAĞLAN SEKMESİ ───
+	connectTab := container.NewVBox(
 		container.NewPadded(container.NewVBox(title, subtitle)),
 		widget.NewSeparator(),
 		container.NewPadded(container.NewVBox(statusRow, timerLabel, statsRow)),
@@ -204,7 +205,81 @@ func main() {
 		container.NewPadded(container.NewVBox(logHeader, logScroll)),
 	)
 
-	myWindow.SetContent(content)
+	// ─── AYARLAR SEKMESİ ───
+	serverIPEntry := widget.NewEntry()
+	serverIPEntry.SetText(cfg.ServerIP)
+	serverIPEntry.SetPlaceHolder("Örn: 192.168.1.100")
+
+	portEntry := widget.NewEntry()
+	portEntry.SetText(fmt.Sprintf("%d", cfg.Port))
+	portEntry.SetPlaceHolder("Varsayılan: 8079")
+
+	keyEntry := widget.NewPasswordEntry()
+	keyEntry.SetText(cfg.VPNKey)
+	keyEntry.SetPlaceHolder("Tam 32 karakter AES-256 anahtarı")
+
+	keyInfo := canvas.NewText("⚠ Sunucu ile aynı anahtar kullanılmalı", color.NRGBA{R: 237, G: 137, B: 54, A: 255})
+	keyInfo.TextSize = 11
+
+	saveBtn := widget.NewButtonWithIcon("  Kaydet", theme.DocumentSaveIcon(), func() {
+		ip := serverIPEntry.Text
+		portStr := portEntry.Text
+		key := keyEntry.Text
+
+		// Validasyon
+		if net.ParseIP(ip) == nil {
+			dialog.ShowError(fmt.Errorf("geçersiz IP adresi: %s", ip), myWindow)
+			return
+		}
+		port := 0
+		if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil || port < 1 || port > 65535 {
+			dialog.ShowError(fmt.Errorf("geçersiz port numarası: %s", portStr), myWindow)
+			return
+		}
+		if len(key) != 32 {
+			dialog.ShowError(fmt.Errorf("VPN anahtarı tam 32 karakter olmalı (şu an: %d karakter)", len(key)), myWindow)
+			return
+		}
+
+		cfg.ServerIP = ip
+		cfg.Port = port
+		cfg.VPNKey = key
+
+		if err := cfg.Save(); err != nil {
+			dialog.ShowError(fmt.Errorf("ayarlar kaydedilemedi: %w", err), myWindow)
+			return
+		}
+
+		// Subtitle'ı güncelle
+		subtitle.Text = "AES-256-GCM • " + cfg.ServerIP
+		subtitle.Refresh()
+
+		dialog.ShowInformation("Kaydedildi", "Ayarlar başarıyla kaydedildi.\nYeni sunucu: "+cfg.ServerIP, myWindow)
+		appendLog("Ayarlar güncellendi → " + cfg.ServerIP)
+	})
+	saveBtn.Importance = widget.HighImportance
+
+	settingsForm := widget.NewForm(
+		widget.NewFormItem("Sunucu IP", serverIPEntry),
+		widget.NewFormItem("Kontrol Portu", portEntry),
+		widget.NewFormItem("VPN Anahtarı", keyEntry),
+	)
+
+	settingsTab := container.NewVBox(
+		container.NewPadded(settingsForm),
+		container.NewPadded(keyInfo),
+		widget.NewSeparator(),
+		container.NewPadded(saveBtn),
+	)
+
+	// ─── TAB CONTAINER ───
+	tabs := container.NewAppTabs(
+		container.NewTabItemWithIcon("Bağlan", theme.MediaPlayIcon(), connectTab),
+		container.NewTabItemWithIcon("Ayarlar", theme.SettingsIcon(), settingsTab),
+	)
+	tabs.SetTabLocation(container.TabLocationTop)
+
+	myWindow.SetContent(tabs)
 	appendLog("Hazır — Bağlan'a basın.")
 	myWindow.ShowAndRun()
 }
@@ -225,7 +300,7 @@ func formatBytes(b uint64) string {
 
 // ─── VPN BAĞLANTI FONKSİYONLARI ───
 
-func connectVPN(state *VPNState, logFn func(string)) error {
+func connectVPN(state *VPNState, cfg *config.ClientConfig, logFn func(string)) error {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
@@ -233,12 +308,31 @@ func connectVPN(state *VPNState, logFn func(string)) error {
 		return fmt.Errorf("zaten bağlı")
 	}
 
+	vpnKey := []byte(cfg.VPNKey)
+	if len(vpnKey) != 32 {
+		return fmt.Errorf("VPN anahtarı 32 karakter olmalı (şu an: %d). Ayarlar sekmesini kontrol edin", len(vpnKey))
+	}
+
+	// 1. Handshake — sunucudan sanal IP al
+	logFn("Sunucuya bağlanılıyor (handshake)...")
+	serverAddr := fmt.Sprintf("%s:%d", cfg.ServerIP, cfg.Port)
+	assignedIP, err := performHandshake(serverAddr)
+	if err != nil {
+		return fmt.Errorf("handshake başarısız: %w", err)
+	}
+	logFn(fmt.Sprintf("Sanal IP atandı: %s", assignedIP))
+
+	// 2. TUN arayüzü oluştur
 	logFn("TUN arayüzü oluşturuluyor...")
-	tun := utils.CreateTUN("10.0.0.2", "10.0.0.1", "utun5")
+	tun, err := utils.CreateTUN(assignedIP.String(), "10.0.0.1", "")
+	if err != nil {
+		return err
+	}
 	logFn("TUN: " + tun.Name())
 
+	// 3. Routing ayarla
 	logFn("Routing ayarlanıyor...")
-	origGW, origDev := utils.SetupClientRouting(ServerIP, tun.Name())
+	origGW, origDev := utils.SetupClientRouting(cfg.ServerIP, tun.Name())
 
 	state.origGW = origGW
 	state.origDev = origDev
@@ -249,49 +343,82 @@ func connectVPN(state *VPNState, logFn func(string)) error {
 	state.bytesRecv.Store(0)
 	state.connected = true
 
-	go runTunnel(tun, state.stopChan, &state.bytesSent, &state.bytesRecv, logFn)
+	// logFn goroutine'den çağrıldığında fyne thread'ine ilet
+	safeLog := func(msg string) {
+		fyne.Do(func() { logFn(msg) })
+	}
+
+	go runTunnel(tun, cfg.ServerIP, vpnKey, state.stopChan, &state.bytesSent, &state.bytesRecv, safeLog)
 	return nil
 }
 
-func disconnectVPN(state *VPNState, logFn func(string)) {
+func disconnectVPN(state *VPNState, cfg *config.ClientConfig, logFn func(string)) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
 	if !state.connected {
 		return
 	}
-
 	if state.stopChan != nil {
 		close(state.stopChan)
 	}
-
-	utils.CleanupClientRouting(ServerIP, state.origGW, state.origDev)
+	utils.CleanupClientRouting(cfg.ServerIP, state.origGW, state.origDev)
+	if state.tunIface != nil {
+		state.tunIface.Close() // TUN kaynağını serbest bırak
+	}
 	state.connected = false
 	state.tunIface = nil
 	logFn("Routing temizlendi.")
 }
 
-func runTunnel(tun *water.Interface, stop chan struct{}, bytesSent *atomic.Uint64, bytesRecv *atomic.Uint64, logFn func(string)) {
-	addrTCP, _ := net.ResolveUDPAddr("udp", ServerIP+":8080")
+// performHandshake sunucuya Hello gönderir ve atanan sanal IP'yi alır.
+func performHandshake(serverAddr string) (net.IP, error) {
+	addr, err := net.ResolveUDPAddr("udp", serverAddr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialUDP("udp", nil, addr)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	if _, err := conn.Write(vpn.HelloPacket); err != nil {
+		return nil, fmt.Errorf("hello gönderilemedi: %w", err)
+	}
+
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, fmt.Errorf("welcome beklerken zaman aşımı: %w (sunucu çalışıyor mu?)", err)
+	}
+
+	return vpn.ParseWelcomePacket(buf[:n])
+}
+
+func runTunnel(tun *water.Interface, serverIP string, vpnKey []byte, stop chan struct{}, bytesSent *atomic.Uint64, bytesRecv *atomic.Uint64, logFn func(string)) {
+	addrTCP, _ := net.ResolveUDPAddr("udp", serverIP+":8080")
 	connTCP, err := net.DialUDP("udp", nil, addrTCP)
 	if err != nil {
 		logFn("TCP bağlantı hatası: " + err.Error())
 		return
 	}
 
-	addrUDP, _ := net.ResolveUDPAddr("udp", ServerIP+":8081")
+	addrUDP, _ := net.ResolveUDPAddr("udp", serverIP+":8081")
 	connUDP, err := net.DialUDP("udp", nil, addrUDP)
 	if err != nil {
 		logFn("UDP bağlantı hatası: " + err.Error())
 		return
 	}
 
-	logFn("Sunucuya bağlanıldı ✓")
+	logFn("Sunucuya veri kanalı açıldı ✓")
 
-	go listenNet(connTCP, tun, stop, "TCP", bytesRecv)
-	go listenNet(connUDP, tun, stop, "UDP", bytesRecv)
+	go listenNet(connTCP, tun, stop, "TCP", vpnKey, bytesRecv)
+	go listenNet(connUDP, tun, stop, "UDP", vpnKey, bytesRecv)
 
-	buf := make([]byte, 2000)
+	buf := make([]byte, 65535)
 	for {
 		select {
 		case <-stop:
@@ -321,8 +448,8 @@ func runTunnel(tun *water.Interface, stop chan struct{}, bytesSent *atomic.Uint6
 	}
 }
 
-func listenNet(conn *net.UDPConn, tun *water.Interface, stop chan struct{}, label string, bytesRecv *atomic.Uint64) {
-	buf := make([]byte, 2000)
+func listenNet(conn *net.UDPConn, tun *water.Interface, stop chan struct{}, label string, vpnKey []byte, bytesRecv *atomic.Uint64) {
+	buf := make([]byte, 65535)
 	for {
 		select {
 		case <-stop:
@@ -330,9 +457,13 @@ func listenNet(conn *net.UDPConn, tun *water.Interface, stop chan struct{}, labe
 		default:
 		}
 
+		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		n, _, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			continue
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue // stop channel kontrolü için döngü başına dön
+			}
+			return // gerçek hata (bağlantı kapatıldı)
 		}
 
 		decrypted, err := utils.Decrypt(buf[:n], vpnKey)

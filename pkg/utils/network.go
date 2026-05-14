@@ -2,6 +2,7 @@ package utils
 
 import (
 	"encoding/binary"
+	"fmt"
 	"log"
 	"net"
 	"os/exec"
@@ -33,6 +34,10 @@ type IPv4 struct {
 }
 
 func ParseIPv4(packet []byte) IPv4 {
+	// IPv4 başlığı en az 20 byte — kısa paket gelirse boş struct dön (panic önlemi)
+	if len(packet) < 20 {
+		return IPv4{}
+	}
 	return IPv4{
 		Version:        (packet[0] & 0xF0) >> 4,
 		IHL:            (packet[0] & 0x0F),
@@ -50,25 +55,19 @@ func ParseIPv4(packet []byte) IPv4 {
 	}
 }
 
-func CreateTUN(ipAddr string, peer string, tunName string) *water.Interface {
-	// Linux için Interface ayarı (Linux'ta isim genelde tun0, tun1 olur ama isim zorlamayalım)
-	config := water.Config{
+// CreateTUN yeni bir TUN arayüzü oluşturur ve IP adresini yapılandırır.
+// Hata durumunda (ör. yetersiz yetki) nil ve error döndürür; log.Fatal kullanmaz.
+func CreateTUN(ipAddr string, peer string, tunName string) (*water.Interface, error) {
+	cfg := water.Config{
 		DeviceType: water.TUN,
 	}
-	// water kütüphanesi Linux'ta ismi kendi de atayabilir,
-	// ama sabit isim istiyorsan config.PlatformSpecificParams.Name kullanabilirsin.
-	// Şimdilik basit tutalım, Linux kendi isimlendirsin (tun0 vb.)
 
-	iface, err := water.New(config)
+	iface, err := water.New(cfg)
 	if err != nil {
-		log.Fatal("Failed to create TUN:", err)
+		return nil, fmt.Errorf("TUN arayüzü oluşturulamadı (sudo ile çalıştırdığınızdan emin olun): %w", err)
 	}
 
-	log.Println("Allocated TUN interface:", iface.Name())
-
-	// --- BURASI DEĞİŞTİ (LINUX İÇİN IP KOMUTLARI) ---
-	// Eski (Mac): ifconfig utunX 10.0.0.1 10.0.0.2 up
-	// Yeni (Linux): ip link set dev tun0 up && ip addr add 10.0.0.1 peer 10.0.0.2 dev tun0
+	log.Println("TUN arayüzü tahsis edildi:", iface.Name())
 
 	cmds := [][]string{
 		{"ip", "link", "set", "dev", iface.Name(), "up"},
@@ -78,12 +77,12 @@ func CreateTUN(ipAddr string, peer string, tunName string) *water.Interface {
 	for _, cmd := range cmds {
 		out, err := exec.Command(cmd[0], cmd[1:]...).CombinedOutput()
 		if err != nil {
-			log.Fatalf("Failed to run %v: %v, output: %s", cmd, err, string(out))
+			return nil, fmt.Errorf("komut hatası %v: %w (çıktı: %s)", cmd, err, string(out))
 		}
 	}
 
-	log.Printf("TUN %s configured with %s <-> %s", iface.Name(), ipAddr, peer)
-	return iface
+	log.Printf("TUN %s yapılandırıldı: %s <-> %s", iface.Name(), ipAddr, peer)
+	return iface, nil
 }
 
 // runCmd: Komutu çalıştırır, hata varsa loglar ama fatal yapmaz.
