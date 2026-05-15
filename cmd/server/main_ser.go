@@ -118,8 +118,8 @@ func startServer(tun *water.Interface, sessions *vpn.SessionManager, cfg *config
 			continue
 		}
 
-		// Hedef sanal IP'ye göre istemciyi bul
-		clientAddr, ok := sessions.GetAddrByVirtualIP(packet.DestAddr)
+		// Hedef sanal IP ve protokole göre istemcinin doğru bearer adresini bul
+		clientAddr, ok := sessions.GetBearerAddrByVirtualIP(packet.DestAddr, packet.Protocol)
 		if !ok {
 			// Bilinmeyen hedef, atla
 			continue
@@ -168,13 +168,17 @@ func readNetToTUN(conn *net.UDPConn, sessions *vpn.SessionManager, tun *water.In
 			continue
 		}
 
-		// Oturumu güncelle (LastSeen) — Write kilidi ile
-		sessions.UpdateLastSeen(clientAddr)
-
 		decrypted, err := utils.Decrypt(buf[:n], vpnKey)
 		if err != nil {
 			log.Printf("[%s] GÜVENLİK: Geçersiz şifreli paket %s'den reddedildi.", label, clientAddr)
 			continue
+		}
+
+		// İç paketin kaynak IP'sine bakarak istemciyi tespit et
+		packet := utils.ParseIPv4(decrypted)
+		if packet.SrcAddr != nil {
+			// Oturumu güncelle: Bu VirtualIP'ye ait oturumun ilgili adresini güncelle
+			sessions.UpdateBearerAddr(packet.SrcAddr, clientAddr, label)
 		}
 
 		tun.Write(decrypted)

@@ -66,6 +66,8 @@ func IsHelloPacket(data []byte) bool {
 type Session struct {
 	VirtualIP  net.IP
 	RemoteAddr *net.UDPAddr
+	TCPAddr    *net.UDPAddr
+	UDPAddr    *net.UDPAddr
 	LastSeen   time.Time
 }
 
@@ -109,6 +111,8 @@ func (sm *SessionManager) Register(remoteAddr *net.UDPAddr) (*Session, error) {
 	sess := &Session{
 		VirtualIP:  ip,
 		RemoteAddr: remoteAddr,
+		TCPAddr:    remoteAddr, // Başlangıçta fallback olarak handshake adresi
+		UDPAddr:    remoteAddr,
 		LastSeen:   time.Now(),
 	}
 	sm.byAddr[key] = sess
@@ -133,16 +137,55 @@ func (sm *SessionManager) UpdateLastSeen(remoteAddr *net.UDPAddr) {
 	}
 }
 
-// GetAddrByVirtualIP sanal IP'ye karşılık gelen uzak adresi döndürür.
-func (sm *SessionManager) GetAddrByVirtualIP(ip net.IP) (*net.UDPAddr, bool) {
+// UpdateBearerAddr iç paketin kaynak IP'sine göre oturumu bulup bearer adresini günceller.
+func (sm *SessionManager) UpdateBearerAddr(ip net.IP, addr *net.UDPAddr, label string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return
+	}
+	
+	// byVirtualIP içinden handshake adresini bul
+	origAddr, ok := sm.byVirtualIP[ip4.String()]
+	if !ok {
+		return
+	}
+	
+	// Oturumu bul ve güncelle
+	if sess, ok := sm.byAddr[origAddr.String()]; ok {
+		sess.LastSeen = time.Now()
+		if label == "TCP-bearer" {
+			sess.TCPAddr = addr
+		} else {
+			sess.UDPAddr = addr
+		}
+	}
+}
+
+// GetBearerAddrByVirtualIP sanal IP ve protokole karşılık gelen uzak adresi döndürür.
+func (sm *SessionManager) GetBearerAddrByVirtualIP(ip net.IP, protocol uint8) (*net.UDPAddr, bool) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	ip4 := ip.To4()
 	if ip4 == nil {
 		return nil, false
 	}
-	addr, ok := sm.byVirtualIP[ip4.String()]
-	return addr, ok
+	origAddr, ok := sm.byVirtualIP[ip4.String()]
+	if !ok {
+		return nil, false
+	}
+	sess, ok := sm.byAddr[origAddr.String()]
+	if !ok {
+		return nil, false
+	}
+	
+	// ProtokolTCP=6 ise TCPAddr, değilse UDPAddr (UDP=17, ICMP=1 vb.)
+	if protocol == 6 {
+		return sess.TCPAddr, true
+	}
+	return sess.UDPAddr, true
 }
 
 // Remove bir istemci oturumunu kaldırır ve IP'yi serbest bırakır.
