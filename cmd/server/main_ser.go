@@ -32,8 +32,9 @@ func main() {
 		log.Fatalf("VPN anahtarı tam 32 karakter olmalı (şu an: %d). ~/.myvpn/server.json dosyasını kontrol edin.", len(vpnKey))
 	}
 
-	// TUN cihazını oluştur
-	tun, err := utils.CreateTUN("10.0.0.1", "10.0.0.2", "")
+	// TUN cihazını oluştur (CIDR modu — tüm 10.0.0.0/24 subnet için route otomatik).
+	// Eski versiyon "peer 10.0.0.2" kullanıyordu; bu sadece tek istemciye route oluşturuyordu.
+	tun, err := utils.CreateTUN("10.0.0.1/24", "", "")
 	if err != nil {
 		log.Fatal("TUN hatası:", err)
 	}
@@ -111,8 +112,9 @@ func startServer(tun *water.Interface, sessions *vpn.SessionManager, cfg *config
 			continue
 		}
 
-		packet := utils.ParseIPv4(buf[:n])
-		encrypted, err := utils.Encrypt(buf[:n], vpnKey)
+		rawIPv4 := utils.ExtractIPv4(buf[:n])
+		packet := utils.ParseIPv4(rawIPv4)
+		encrypted, err := utils.Encrypt(rawIPv4, vpnKey)
 		if err != nil {
 			log.Println("Şifreleme hatası:", err)
 			continue
@@ -176,11 +178,13 @@ func readNetToTUN(conn *net.UDPConn, sessions *vpn.SessionManager, tun *water.In
 
 		// İç paketin kaynak IP'sine bakarak istemciyi tespit et
 		packet := utils.ParseIPv4(decrypted)
+		log.Printf("[%s] Packet received! Len: %d bytes, Parsed SrcIP: %s, Protocol: %d", label, len(decrypted), packet.SrcAddr.String(), packet.Protocol)
+
 		if packet.SrcAddr != nil {
 			// Oturumu güncelle: Bu VirtualIP'ye ait oturumun ilgili adresini güncelle
 			sessions.UpdateBearerAddr(packet.SrcAddr, clientAddr, label)
 		}
 
-		tun.Write(decrypted)
+		tun.Write(utils.PrependPI(decrypted))
 	}
 }

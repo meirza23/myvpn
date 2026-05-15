@@ -280,6 +280,17 @@ func main() {
 	tabs.SetTabLocation(container.TabLocationTop)
 
 	myWindow.SetContent(tabs)
+
+	// Kullanıcı pencereyi kapatırken bağlıysa routing/TUN/DNS temizliği yap.
+	// Aksi halde sistem bozuk routing kuralları ile kalır (internet "kopuk" görünür).
+	myWindow.SetCloseIntercept(func() {
+		if state.connected {
+			appendLog("Pencere kapatılıyor — VPN temizleniyor...")
+			disconnectVPN(state, cfg, appendLog)
+		}
+		myWindow.Close()
+	})
+
 	appendLog("Hazır — Bağlan'a basın.")
 	myWindow.ShowAndRun()
 }
@@ -359,15 +370,18 @@ func disconnectVPN(state *VPNState, cfg *config.ClientConfig, logFn func(string)
 	if !state.connected {
 		return
 	}
+	// Stop sinyali — nil yaparak ikinci disconnect'te double-close panic'i engellenir.
 	if state.stopChan != nil {
 		close(state.stopChan)
+		state.stopChan = nil
+	}
+	// TUN'u routing temizliğinden ÖNCE kapat — bloklayıcı tun.Read() çağrıları çıksın.
+	if state.tunIface != nil {
+		state.tunIface.Close()
+		state.tunIface = nil
 	}
 	utils.CleanupClientRouting(cfg.ServerIP, state.origGW, state.origDev)
-	if state.tunIface != nil {
-		state.tunIface.Close() // TUN kaynağını serbest bırak
-	}
 	state.connected = false
-	state.tunIface = nil
 	logFn("Routing temizlendi.")
 }
 
@@ -405,6 +419,7 @@ func runTunnel(tun *water.Interface, serverIP string, vpnKey []byte, stop chan s
 		logFn("TCP bağlantı hatası: " + err.Error())
 		return
 	}
+	defer connTCP.Close()
 
 	addrUDP, _ := net.ResolveUDPAddr("udp", serverIP+":8081")
 	connUDP, err := net.DialUDP("udp", nil, addrUDP)
@@ -412,6 +427,7 @@ func runTunnel(tun *water.Interface, serverIP string, vpnKey []byte, stop chan s
 		logFn("UDP bağlantı hatası: " + err.Error())
 		return
 	}
+	defer connUDP.Close()
 
 	logFn("Sunucuya veri kanalı açıldı ✓")
 
@@ -422,19 +438,24 @@ func runTunnel(tun *water.Interface, serverIP string, vpnKey []byte, stop chan s
 	for {
 		select {
 		case <-stop:
-			connTCP.Close()
-			connUDP.Close()
 			return
 		default:
 		}
 
 		n, err := tun.Read(buf)
 		if err != nil {
-			continue
+			// TUN kapatıldıysa Read hata döner — stop'u kontrol edip çık.
+			select {
+			case <-stop:
+				return
+			default:
+				continue
+			}
 		}
 
-		packet := utils.ParseIPv4(buf[:n])
-		encrypted, err := utils.Encrypt(buf[:n], vpnKey)
+		rawIPv4 := utils.ExtractIPv4(buf[:n])
+		packet := utils.ParseIPv4(rawIPv4)
+		encrypted, err := utils.Encrypt(rawIPv4, vpnKey)
 		if err != nil {
 			continue
 		}
@@ -472,7 +493,7 @@ func listenNet(conn *net.UDPConn, tun *water.Interface, stop chan struct{}, labe
 			continue
 		}
 
-		tun.Write(decrypted)
+		tun.Write(utils.PrependPI(decrypted))
 		bytesRecv.Add(uint64(n))
 	}
 }
