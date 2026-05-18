@@ -28,6 +28,11 @@ import (
 type VPNState struct {
 	mu        sync.Mutex
 	connected bool
+	// serverIP: bağlanma anındaki sunucu IP'sini saklar. Kullanıcı bağlıyken
+	// ayarlardan IP'yi değiştirip kaydederse cfg.ServerIP değişir; disconnect'te
+	// CleanupClientRouting'in DOĞRU IP'yi (yani gerçekten eklediğimiz host route'u)
+	// silmesi için bu değeri ayrı tutuyoruz.
+	serverIP  string
 	origGW    string
 	origDev   string
 	tunIface  *water.Interface
@@ -222,6 +227,16 @@ func main() {
 	keyInfo.TextSize = 11
 
 	saveBtn := widget.NewButtonWithIcon("  Kaydet", theme.DocumentSaveIcon(), func() {
+		// VPN bağlıyken ayar değiştirilirse routing temizliği yanlış IP'ye gider
+		// ve OS'ta stale host route kalır. Bunu engelliyoruz: önce disconnect zorlu.
+		state.mu.Lock()
+		isConnected := state.connected
+		state.mu.Unlock()
+		if isConnected {
+			dialog.ShowError(fmt.Errorf("VPN bağlıyken ayarlar değiştirilemez.\nÖnce Bağlan sekmesinden 'Kes' butonuna basın, sonra ayarları kaydedin."), myWindow)
+			return
+		}
+
 		ip := serverIPEntry.Text
 		portStr := portEntry.Text
 		key := keyEntry.Text
@@ -324,6 +339,10 @@ func connectVPN(state *VPNState, cfg *config.ClientConfig, logFn func(string)) e
 		return fmt.Errorf("VPN anahtarı 32 karakter olmalı (şu an: %d). Ayarlar sekmesini kontrol edin", len(vpnKey))
 	}
 
+	// 0. Önceki oturumlardan kalan döküntüleri temizle (stale tun*, default tun rotaları).
+	// Crash veya temiz olmayan kapanma sonrası kalan state burada giderilir.
+	utils.CleanStaleClientState()
+
 	// 1. Handshake — sunucudan sanal IP al
 	logFn("Sunucuya bağlanılıyor (handshake)...")
 	serverAddr := fmt.Sprintf("%s:%d", cfg.ServerIP, cfg.Port)
@@ -345,6 +364,9 @@ func connectVPN(state *VPNState, cfg *config.ClientConfig, logFn func(string)) e
 	logFn("Routing ayarlanıyor...")
 	origGW, origDev := utils.SetupClientRouting(cfg.ServerIP, tun.Name())
 
+	// connectedServerIP: kullanıcı bağlıyken ayarlardan IP'yi değiştirse bile
+	// disconnect bu IP'yi kullanacak (route temizliği doğru olsun diye).
+	state.serverIP = cfg.ServerIP
 	state.origGW = origGW
 	state.origDev = origDev
 	state.tunIface = tun
@@ -380,7 +402,11 @@ func disconnectVPN(state *VPNState, cfg *config.ClientConfig, logFn func(string)
 		state.tunIface.Close()
 		state.tunIface = nil
 	}
-	utils.CleanupClientRouting(cfg.ServerIP, state.origGW, state.origDev)
+	// state.serverIP: bağlanma anındaki gerçek IP (cfg.ServerIP olabilir,
+	// bağlıyken kullanıcı ayarlardan değiştirmişse cfg ile uyuşmaz; biz state'tekini
+	// kullanıyoruz ki SetupClientRouting'in eklediği host route doğru silinsin).
+	utils.CleanupClientRouting(state.serverIP, state.origGW, state.origDev)
+	state.serverIP = ""
 	state.connected = false
 	logFn("Routing temizlendi.")
 }

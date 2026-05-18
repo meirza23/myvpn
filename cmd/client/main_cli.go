@@ -107,6 +107,11 @@ func connect(scanner *bufio.Scanner, cfg *config.ClientConfig) {
 		return
 	}
 
+	// 0. Önceki oturumdan kalan döküntüleri temizle (stale tun arayüzleri,
+	// hâlâ duran "default dev tun*" rotaları vs.). Crash veya AWS reboot
+	// sonrası kalmış olabilir.
+	utils.CleanStaleClientState()
+
 	// 1. Handshake
 	utils.PrintInfo("Sunucuya bağlanılıyor (handshake)...")
 	serverAddr := fmt.Sprintf("%s:%d", srvIP, cfg.Port)

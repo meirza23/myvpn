@@ -219,6 +219,37 @@ func splitFields(s string) []string {
 	return fields
 }
 
+// CleanStaleClientState önceki MyVPN oturumlarından kalan kalıntıları
+// (default rotası "dev tun*" olan kayıtlar ile artık olmayan tun*
+// arayüzleri) silmeye çalışır. Tüm hataları yutmak güvenli, çünkü
+// kayıt zaten yoksa "delete failed" beklenen davranıştır.
+//
+// Bu fonksiyon connect başlangıcında çağrılır — kullanıcı önceki bir
+// oturumda temiz disconnect yapamadıysa (örn. proses crash, AWS instance
+// reboot vs.) yeni bağlantı eskisinin döküntüleri ile çakışmasın.
+func CleanStaleClientState() {
+	// Eski "default dev tunN" rotalarını sil (N = 0..3 yeterli)
+	for i := 0; i < 4; i++ {
+		runCmd("ip", "route", "del", "default", "dev", fmt.Sprintf("tun%d", i))
+	}
+	// 10.0.0.0/24 subnet'i için tun rotaları (sunucu CIDR modu kullanırsa kalır)
+	runCmd("ip", "route", "del", "10.0.0.0/24")
+
+	// Eski tun* arayüzleri — sadece adı tun ile başlayanları
+	out, err := exec.Command("ip", "-br", "link", "show").CombinedOutput()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		// Format: "tun0             UNKNOWN        ..."
+		fields := splitFields(line)
+		if len(fields) > 0 && strings.HasPrefix(fields[0], "tun") {
+			name := strings.Split(fields[0], "@")[0] // "tun0@..." → "tun0"
+			runCmd("ip", "link", "del", name)
+		}
+	}
+}
+
 // SetupClientRouting: Tüm trafiği VPN tüneline yönlendirir.
 // serverIP: VPN sunucusunun gerçek IP adresi
 // tunName: TUN arayüzünün adı
