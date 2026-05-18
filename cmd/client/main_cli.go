@@ -51,6 +51,7 @@ func main() {
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
+		utils.PrintMenuSeparator()
 		utils.PrintStatus(connected, serverIP)
 		utils.PrintMenu(connected)
 
@@ -67,7 +68,8 @@ func main() {
 				disconnect()
 			}
 		case "2":
-			utils.PrintStatus(connected, serverIP)
+			// Status zaten döngünün başında PrintStatus ile basılıyor;
+			// burada ekstra çağrı yapmıyoruz (duplicate ekran çıktısını önlemek için).
 		case "3":
 			disconnect()
 			utils.PrintInfo("Güle güle!")

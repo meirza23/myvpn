@@ -46,6 +46,14 @@ func PrintStatus(connected bool, serverIP string) {
 	fmt.Println()
 }
 
+// PrintMenuSeparator: Bir önceki çıktı ile menü arasına belirgin bir ayraç basar.
+// Ekranı temizlemez — geçmiş scroll edilebilir kalır, sadece görsel sınır çizilir.
+func PrintMenuSeparator() {
+	// İki boş satır + kalın çift çizgi + bir boş satır
+	fmt.Printf("\n\n%s  ══════════════════════════════════════════════════════════%s\n\n",
+		ColorCyan+ColorBold, ColorReset)
+}
+
 // PrintMenu: Menü seçeneklerini gösterir.
 func PrintMenu(connected bool) {
 	fmt.Println(ColorCyan + "  ─────────────────────────────────" + ColorReset)
